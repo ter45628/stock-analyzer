@@ -1,13 +1,64 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # --- การตั้งค่าหน้าเว็บ ---
 st.set_page_config(page_title="PRO US Stock Analyzer", layout="wide")
+
+# --- ฟังก์ชันคำนวณ Indicators ---
+def calculate_ema(data, period):
+    return data.ewm(span=period, adjust=False).mean()
+
+def calculate_rsi(data, period=14):
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(data, fast=12, slow=26, signal=9):
+    ema_fast = data.ewm(span=fast, adjust=False).mean()
+    ema_slow = data.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def calculate_bollinger_bands(data, period=20, std=2):
+    sma = data.rolling(window=period).mean()
+    rolling_std = data.rolling(window=period).std()
+    upper_band = sma + (rolling_std * std)
+    lower_band = sma - (rolling_std * std)
+    return upper_band, sma, lower_band
+
+def calculate_supertrend(high, low, close, period=7, multiplier=3):
+    hl_avg = (high + low) / 2
+    atr = (high - low).rolling(window=period).mean()
+    
+    upper_band = hl_avg + (multiplier * atr)
+    lower_band = hl_avg - (multiplier * atr)
+    
+    supertrend = pd.Series(index=close.index, dtype=float)
+    direction = pd.Series(index=close.index, dtype=int)
+    
+    supertrend.iloc[0] = lower_band.iloc[0]
+    direction.iloc[0] = 1
+    
+    for i in range(1, len(close)):
+        if close.iloc[i] > supertrend.iloc[i-1]:
+            supertrend.iloc[i] = lower_band.iloc[i]
+            direction.iloc[i] = 1
+        elif close.iloc[i] < supertrend.iloc[i-1]:
+            supertrend.iloc[i] = upper_band.iloc[i]
+            direction.iloc[i] = -1
+        else:
+            supertrend.iloc[i] = supertrend.iloc[i-1]
+            direction.iloc[i] = direction.iloc[i-1]
+    
+    return supertrend, direction
 
 # --- ฟังก์ชันหาแนวรับแนวต้าน ---
 def get_levels(df, window=20):
@@ -33,23 +84,34 @@ risk_percent = st.sidebar.slider("ความเสี่ยงที่รั�
 if ticker:
     try:
         # ดึงข้อมูล
-        data = yf.download(ticker, period="2y", interval=interval)
+        data = yf.download(ticker, period="2y", interval=interval, progress=False)
         if data.empty:
             st.error("ไม่พบข้อมูลหุ้น โปรดตรวจสอบชื่อ Ticker อีกครั้ง")
         else:
             # --- คำนวณ Indicators ---
-            data['EMA50'] = ta.ema(data['Close'], length=50)
-            data['EMA200'] = ta.ema(data['Close'], length=200)
-            data['RSI'] = ta.rsi(data['Close'], length=14)
-            macd = ta.macd(data['Close'])
-            data = pd.concat([data, macd], axis=1)
-            st_df = ta.supertrend(data['High'], data['Low'], data['Close'], length=7, multiplier=3)
-            data = pd.concat([data, st_df], axis=1)
+            data['EMA50'] = calculate_ema(data['Close'], 50)
+            data['EMA200'] = calculate_ema(data['Close'], 200)
+            data['RSI'] = calculate_rsi(data['Close'], 14)
             
-            # Squeeze Momentum (Basic)
-            bb = ta.bbands(data['Close'], length=20, std=2)
-            kc = ta.kc(data['High'], data['Low'], data['Close'], length=20)
-            data['Squeeze'] = bb['BBU_20_2.0'] < kc['KCUe_20_1.5']
+            macd_line, signal_line, histogram = calculate_macd(data['Close'])
+            data['MACD'] = macd_line
+            data['MACD_Signal'] = signal_line
+            data['MACD_Hist'] = histogram
+            
+            supertrend, direction = calculate_supertrend(data['High'], data['Low'], data['Close'])
+            data['Supertrend'] = supertrend
+            data['ST_Direction'] = direction
+            
+            # Bollinger Bands สำหรับ Squeeze
+            bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(data['Close'])
+            data['BB_Upper'] = bb_upper
+            data['BB_Lower'] = bb_lower
+            
+            # Keltner Channel (ใช้ ATR แทน)
+            atr = (data['High'] - data['Low']).rolling(window=20).mean()
+            kc_upper = bb_middle + (1.5 * atr)
+            kc_lower = bb_middle - (1.5 * atr)
+            data['Squeeze'] = (bb_upper < kc_upper) & (bb_lower > kc_lower)
 
             last_row = data.iloc[-1]
             prev_row = data.iloc[-2]
@@ -60,22 +122,40 @@ if ticker:
             # ตารางสรุปสัญญาณ (Signal Table)
             st.subheader("📊 Signal Summary")
             signals = [
-                ["Trend (EMA 50/200)", "Bullish" if last_row['EMA50'] > last_row['EMA200'] else "Bearish"],
-                ["Momentum (RSI)", "Overbought" if last_row['RSI'] > 70 else ("Oversold" if last_row['RSI'] < 30 else "Neutral")],
-                ["Pulse (MACD)", "Strong Buy" if last_row.iloc[-7] > 0 and prev_row.iloc[-7] <= 0 else "Neutral"],
-                ["Supertrend", "Buy Mode" if last_row['Close'] > last_row.iloc[-4] else "Sell Mode"],
-                ["Squeeze", "Squeezing" if last_row['Squeeze'] else "No Squeeze"]
+                ["Trend (EMA 50/200)", "Bullish ✅" if last_row['EMA50'] > last_row['EMA200'] else "Bearish ❌"],
+                ["Momentum (RSI)", "Overbought 🔴" if last_row['RSI'] > 70 else ("Oversold 🟢" if last_row['RSI'] < 30 else "Neutral ⚪")],
+                ["Pulse (MACD)", f"Strong Buy 🚀" if last_row['MACD_Hist'] > 0 and prev_row['MACD_Hist'] <= 0 else "Neutral ⚪"],
+                ["Supertrend", "Buy Mode 🟢" if last_row['ST_Direction'] > 0 else "Sell Mode 🔴"],
+                ["Squeeze", "Squeezing 💥" if last_row['Squeeze'] else "No Squeeze ⚪"]
             ]
             sig_df = pd.DataFrame(signals, columns=["Indicator", "Signal"])
             st.table(sig_df)
+
+            # แสดงราคาปัจจุบัน
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("ราคาปัจจุบัน", f"${last_row['Close']:.2f}")
+            with col2:
+                change = last_row['Close'] - prev_row['Close']
+                change_pct = (change / prev_row['Close']) * 100
+                st.metric("เปลี่ยนแปลง", f"${change:.2f}", f"{change_pct:.2f}%")
+            with col3:
+                st.metric("Volume", f"{last_row['Volume']:,.0f}")
+            with col4:
+                st.metric("RSI", f"{last_row['RSI']:.2f}")
 
             # --- กราฟ Interactive ---
             fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.6, 0.2, 0.2])
             
             # Row 1: Candlestick + EMA + Supertrend + Levels
-            fig.add_trace(go.Candlestick(x=data.index, open=data['Open'], high=data['High'], low=data['Low'], close=data['Close'], name="Price"), row=1, col=1)
-            fig.add_trace(go.Scatter(x=data.index, y=data['EMA50'], name="EMA 50", line=dict(color='yellow')), row=1, col=1)
-            fig.add_trace(go.Scatter(x=data.index, y=data['EMA200'], name="EMA 200", line=dict(color='orange')), row=1, col=1)
+            fig.add_trace(go.Candlestick(x=data.index, open=data['Open'], high=data['High'], 
+                                        low=data['Low'], close=data['Close'], name="Price"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=data.index, y=data['EMA50'], name="EMA 50", 
+                                    line=dict(color='yellow', width=2)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=data.index, y=data['EMA200'], name="EMA 200", 
+                                    line=dict(color='orange', width=2)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=data.index, y=data['Supertrend'], name="Supertrend", 
+                                    line=dict(color='purple', width=1, dash='dash')), row=1, col=1)
             
             # วาดแนวรับแนวต้านล่าสุด
             levels = get_levels(data)
@@ -84,28 +164,54 @@ if ticker:
                 fig.add_hline(y=val, line_dash="dash", line_color=color, opacity=0.3, row=1, col=1)
 
             # Row 2: RSI
-            fig.add_trace(go.Scatter(x=data.index, y=data['RSI'], name="RSI", line=dict(color='purple')), row=2, col=1)
+            fig.add_trace(go.Scatter(x=data.index, y=data['RSI'], name="RSI", 
+                                    line=dict(color='purple', width=2)), row=2, col=1)
             fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
             fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
 
             # Row 3: MACD
-            fig.add_trace(go.Bar(x=data.index, y=data.iloc[:, -7], name="MACD Hist"), row=3, col=1)
+            fig.add_trace(go.Bar(x=data.index, y=data['MACD_Hist'], name="MACD Hist", 
+                                marker_color='lightblue'), row=3, col=1)
+            fig.add_trace(go.Scatter(x=data.index, y=data['MACD'], name="MACD", 
+                                    line=dict(color='blue', width=1)), row=3, col=1)
+            fig.add_trace(go.Scatter(x=data.index, y=data['MACD_Signal'], name="Signal", 
+                                    line=dict(color='red', width=1)), row=3, col=1)
             
-            fig.update_layout(height=800, template="plotly_dark", xaxis_rangeslider_visible=False)
+            fig.update_layout(height=800, template="plotly_dark", xaxis_rangeslider_visible=False, 
+                            showlegend=True, hovermode='x unified')
             st.plotly_chart(fig, use_container_width=True)
 
             # --- Risk Calculator Logic ---
             st.sidebar.subheader("🎯 แผนการเทรด")
-            stop_loss = st.sidebar.number_input("จุดตัดขาดทุน (Stop Loss)", value=float(last_row['Low'] * 0.97))
+            stop_loss = st.sidebar.number_input("จุดตัดขาดทุน (Stop Loss)", 
+                                                value=float(last_row['Low'] * 0.97), 
+                                                format="%.2f")
             risk_amt = capital * risk_percent
             risk_per_sh = last_row['Close'] - stop_loss
             
             if risk_per_sh > 0:
                 shares = int(risk_amt / risk_per_sh)
-                st.sidebar.success(f"จำนวนหุ้นที่แนะนำ: {shares} หุ้น")
-                st.sidebar.info(f"หากโดน SL จะขาดทุน: ${risk_amt:,.2f}")
+                total_cost = shares * last_row['Close']
+                st.sidebar.success(f"✅ จำนวนหุ้นที่แนะนำ: **{shares} หุ้น**")
+                st.sidebar.info(f"💰 ใช้เงิน: **${total_cost:,.2f}**")
+                st.sidebar.warning(f"⚠️ หากโดน SL จะขาดทุน: **${risk_amt:,.2f}**")
+                
+                # คำนวณ Take Profit (Risk:Reward 1:2)
+                take_profit = last_row['Close'] + (2 * risk_per_sh)
+                potential_profit = (take_profit - last_row['Close']) * shares
+                st.sidebar.success(f"🎯 Take Profit (R:R 1:2): **${take_profit:.2f}**")
+                st.sidebar.success(f"💵 กำไรที่คาดหวัง: **${potential_profit:,.2f}**")
             else:
-                st.sidebar.warning("จุด SL ต้องต่ำกว่าราคาปัจจุบัน")
+                st.sidebar.error("❌ จุด SL ต้องต่ำกว่าราคาปัจจุบัน")
+
+            # แสดงข้อมูลเพิ่มเติม
+            with st.expander("📋 ข้อมูลเพิ่มเติม"):
+                st.write(f"**High (24h):** ${last_row['High']:.2f}")
+                st.write(f"**Low (24h):** ${last_row['Low']:.2f}")
+                st.write(f"**EMA 50:** ${last_row['EMA50']:.2f}")
+                st.write(f"**EMA 200:** ${last_row['EMA200']:.2f}")
+                st.write(f"**Supertrend:** ${last_row['Supertrend']:.2f}")
 
     except Exception as e:
-        st.error(f"เกิดข้อผิดพลาด: {e}")
+        st.error(f"❌ เกิดข้อผิดพลาด: {e}")
+        st.info("💡 ลองเปลี่ยน Ticker หรือ Timeframe")
